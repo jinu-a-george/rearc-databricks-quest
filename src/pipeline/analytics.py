@@ -60,15 +60,11 @@ def productivity_annual_ranking(
         F.countDistinct("period").alias("_distinct_quarter_count"),
         F.sum("value").alias("annual_value"),
     )
-    complete_years = annual_totals.filter(
-        (F.col("_observation_count") == 4)
-        & (F.col("_distinct_quarter_count") == 4)
-    )
     ranking = Window.partitionBy("series_id", "_snapshot_id").orderBy(
         F.col("annual_value").desc()
     )
     winning_years = (
-        complete_years.withColumn("year_rank", F.dense_rank().over(ranking))
+        annual_totals.withColumn("year_rank", F.dense_rank().over(ranking))
         .filter(F.col("year_rank") == 1)
         .alias("winning")
     )
@@ -101,6 +97,11 @@ def productivity_annual_ranking(
         F.col("winning._observation_count")
         .cast("int")
         .alias("quarterly_observation_count"),
+        (
+            (F.col("winning._observation_count") == 4)
+            & (F.col("winning._distinct_quarter_count") == 4)
+        )
+        .alias("is_full_calendar_year"),
         F.col("winning._snapshot_id").alias("_snapshot_id"),
         F.current_timestamp().alias("_calculated_at"),
     )
@@ -114,7 +115,12 @@ def productivity_population_comparison(
     selected_series = observations.filter(
         (F.col("series_id") == "PRS30006032") & (F.col("period") == "Q01")
     ).alias("observations")
-    population_by_year = population.select(
+    # The comparison asks for US population; DataUSA currently returns the
+    # single nation 01000US, and the filter keeps the join fan-out-free if the
+    # source ever returns more nations.
+    population_by_year = population.filter(
+        F.col("nation_id") == "01000US"
+    ).select(
         "year",
         "nation",
         "population",

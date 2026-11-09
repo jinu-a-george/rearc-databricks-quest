@@ -33,9 +33,10 @@ POPULATION_STATISTICS_COLUMN_COMMENTS = {
 PRODUCTIVITY_RANKING_COLUMN_COMMENTS = {
     "series_id": "BLS identifier for the productivity time series.",
     "series_description": "Human-readable description valid for the source snapshot.",
-    "winning_year": "Year with the highest complete annual sum; ties are retained.",
-    "annual_value": "Sum of the four quarterly productivity values.",
-    "quarterly_observation_count": "Number of distinct quarterly observations included; always four.",
+    "winning_year": "Year with the highest sum of observed Q01-Q04 values; ties are retained and partial years may win.",
+    "annual_value": "Sum of the quarterly Q01-Q04 productivity values observed for the winning year.",
+    "quarterly_observation_count": "Number of quarterly observations summed for the winning year.",
+    "is_full_calendar_year": "True when the winning year has exactly one observation for each of Q01-Q04.",
     "_snapshot_id": "Coordinated source snapshot used for this result.",
     "_calculated_at": "Timestamp when this Gold result was calculated.",
 }
@@ -93,6 +94,7 @@ PRODUCTIVITY_RANKING_SCHEMA = _schema_with_comments(
         ("winning_year", "INT"),
         ("annual_value", "DOUBLE"),
         ("quarterly_observation_count", "INT"),
+        ("is_full_calendar_year", "BOOLEAN"),
         ("_snapshot_id", "STRING"),
         ("_calculated_at", "TIMESTAMP"),
     ],
@@ -133,7 +135,7 @@ def population_statistics():
 
 @dp.materialized_view(
     name="productivity_annual_ranking",
-    comment="All tied peak annual BLS Q01-Q04 sums per series and source snapshot; incomplete years are excluded.",
+    comment="All tied peak annual sums of observed BLS Q01-Q04 values per series and source snapshot; is_full_calendar_year marks complete years.",
     schema=PRODUCTIVITY_RANKING_SCHEMA,
 )
 def productivity_annual_ranking():

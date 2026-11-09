@@ -9,8 +9,6 @@ WITH annual_totals AS (
     FROM rearc_catalog.data_quest_silver.bls_productivity
     WHERE period IN ('Q01', 'Q02', 'Q03', 'Q04')
     GROUP BY series_id, year, _snapshot_id
-    HAVING COUNT(*) = 4
-       AND COUNT(DISTINCT period) = 4
 ),
 ranked_years AS (
     SELECT
@@ -19,6 +17,7 @@ ranked_years AS (
         _snapshot_id,
         annual_value,
         observation_count,
+        COUNT(DISTINCT period) AS distinct_quarter_count,
         DENSE_RANK() OVER (
             PARTITION BY series_id, _snapshot_id
             ORDER BY annual_value DESC
@@ -31,7 +30,11 @@ winning_years AS (
         year,
         _snapshot_id,
         annual_value,
-        observation_count
+        observation_count,
+        (
+            observation_count = 4
+            AND distinct_quarter_count = 4
+        ) AS is_full_calendar_year
     FROM ranked_years
     WHERE year_rank = 1
 )
@@ -41,6 +44,7 @@ SELECT
     CAST(winners.year AS INT) AS winning_year,
     CAST(winners.annual_value AS DOUBLE) AS annual_value,
     CAST(winners.observation_count AS INT) AS quarterly_observation_count,
+    winners.is_full_calendar_year,
     winners._snapshot_id,
     CURRENT_TIMESTAMP() AS _calculated_at
 FROM winning_years AS winners
