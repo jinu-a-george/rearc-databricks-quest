@@ -115,12 +115,7 @@ def productivity_population_comparison(
     selected_series = observations.filter(
         (F.col("series_id") == "PRS30006032") & (F.col("period") == "Q01")
     ).alias("observations")
-    # The comparison asks for US population; DataUSA currently returns the
-    # single nation 01000US, and the filter keeps the join fan-out-free if the
-    # source ever returns more nations.
-    population_by_year = population.filter(
-        F.col("nation_id") == "01000US"
-    ).select(
+    population_by_year = population.select(
         "year",
         "nation",
         "population",

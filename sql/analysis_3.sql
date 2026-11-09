@@ -13,7 +13,6 @@ FROM rearc_catalog.data_quest_silver.bls_productivity AS observations
 LEFT JOIN rearc_catalog.data_quest_silver.population AS population
   ON observations.year = population.year
  AND observations._snapshot_id = population._snapshot_id
- AND population.nation_id = '01000US'
 LEFT JOIN rearc_catalog.data_quest_silver.bls_series AS series
   ON observations.series_id = series.series_id
  AND series.valid_from_snapshot_id <= observations._snapshot_id
