@@ -104,9 +104,9 @@ The project stores source snapshots in a Unity Catalog Volume and loads source-s
 
 Silver applies typed, validated data structures and enriches productivity observations with descriptive series metadata.
 
-![Bronze schema navigation before Silver tables](screenshots/10.1-unity_catalog-data_quest_bronze_tables.png)
+![Silver schema tables](screenshots/10.1-unity_catalog-data_quest_silver_tables.png)
 
-*Unity Catalog table navigation around the Bronze and Silver datasets.*
+*Unity Catalog tables available in the Silver schema.*
 
 ![Silver productivity columns](screenshots/10.2-unity_catalog-data_quest_silver.bls_productivity_table_columns.png)
 
@@ -247,6 +247,10 @@ These screenshots show the deployed jobs, the environment setup task, and the mu
 ![Silver pipeline run](screenshots/15.3-pipeline-silver_layer_pipeline.png)
 
 *Completed Silver pipeline run, showing curated tables and data quality expectations.*
+
+![Gold pipeline run](screenshots/15.4-pipeline-gold_layer_pipeline.png)
+
+*Completed Gold pipeline run and its three analytical output tables.*
 
 ## Genie Agent (bonus)
 
