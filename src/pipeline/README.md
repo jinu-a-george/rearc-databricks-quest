@@ -1,7 +1,9 @@
-# Pipeline implementation status
+# Lakeflow pipeline implementation
 
-`bronze.py` defines Lakeflow Spark Declarative Pipeline materialized views for all currently inspected BLS files and the DataUSA population response. Tables use source-oriented names (`pr_data_1_alldata`, `pr_series`, `population`) within `data_quest_bronze`; a redundant `bronze_` prefix is not used. The ingestion workflow downloads the original files first, then refreshes the pipeline. BLS delimited columns stay strings to preserve source values; DataUSA records use the source's string, integer, and double types, with field names normalized to lowercase snake case for Delta compatibility. The source text documents are exposed as line-based text tables. Bronze does source-format parsing only; quality expectations and business validation will be applied in Silver.
+The three pipeline modules define batch materialized views for the coordinated source snapshots downloaded into the Unity Catalog Volume. The ingestion workflow commits each snapshot before refreshing the pipelines.
 
-`analytics.py` contains the three PySpark analyses over the canonical Silver-layer schemas described in the root README. Matching Spark SQL queries are in `src/sql/`.
+- [`bronze.py`](./bronze.py) parses the discovered BLS tabular sources and DataUSA population response, preserving source values and snapshot metadata. It also exposes malformed or key-incomplete source records in Bronze quarantine.
+- [`silver.py`](./silver.py) casts and validates productivity, series metadata, and population records; enriches series with BLS lookup descriptions; tracks observed series metadata versions; and routes rejected records to Silver quarantine.
+- [`gold.py`](./gold.py) defines the three analytical materialized views using the reusable PySpark transformations in [`analytics.py`](./analytics.py). Equivalent Spark SQL is in [`../../sql/`](../../sql/).
 
-The tables are batch materialized views because the ingestion step refreshes complete source snapshots. Silver and Gold transformations remain pending.
+The Gold outputs are population statistics, annual productivity rankings, and the target-series productivity/population comparison. Their snapshot-aware logic and validation behavior are described in the root [README](../../README.md).

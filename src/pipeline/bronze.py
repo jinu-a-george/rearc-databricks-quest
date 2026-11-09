@@ -81,9 +81,9 @@ MANIFEST_SCHEMA = StructType(
                         StructField("downloaded_at", StringType(), True),
                         StructField("ingestion_status", StringType(), True),
                     ]
-                )
+                ),
+                True,
             ),
-            True,
         ),
     ]
 )
@@ -93,6 +93,131 @@ LATEST_SCHEMA = StructType(
         StructField("status", StringType(), True),
     ]
 )
+
+INGESTION_COLUMN_COMMENTS = {
+    "_snapshot_id": "Identifier of the committed coordinated source snapshot.",
+    "_ingested_at": "Timestamp the source file was downloaded for this snapshot.",
+}
+
+BLS_COLUMN_COMMENTS = {
+    "pr.class": {
+        "class_code": "Code identifying the employee group represented by a series.",
+        "class_text": "Human-readable name of the employee group.",
+        "display_level": "Hierarchy level used with sort_sequence in BLS displays.",
+        "selectable": "Whether this item can be selected in query tools (T or F).",
+        "sort_sequence": "Sort order used with display_level in BLS displays.",
+    },
+    "pr.data.0.Current": {
+        "series_id": "BLS identifier for the specific productivity time series.",
+        "year": "Calendar year of the data observation.",
+        "period": "Quarter or annual-average period code for the observation.",
+        "value": "Source-reported numeric value for the series and period.",
+        "footnote_codes": "Comma-separated footnote codes applying to the observation.",
+    },
+    "pr.data.1.AllData": {
+        "series_id": "BLS identifier for the specific productivity time series.",
+        "year": "Calendar year of the data observation.",
+        "period": "Quarter or annual-average period code for the observation.",
+        "value": "Source-reported numeric value for the series and period.",
+        "footnote_codes": "Comma-separated footnote codes applying to the observation.",
+    },
+    "pr.duration": {
+        "duration_code": "Code identifying whether a measure is a percent change or index.",
+        "duration_text": "Description of the measure's duration or comparison basis.",
+        "display_level": "Hierarchy level used with sort_sequence in BLS displays.",
+        "selectable": "Whether this item can be selected in query tools (T or F).",
+        "sort_sequence": "Sort order used with display_level in BLS displays.",
+    },
+    "pr.footnote": {
+        "footnote_code": "Code identifying an individual BLS footnote.",
+        "footnote_text": "Text describing the footnote.",
+    },
+    "pr.measure": {
+        "measure_code": "Code identifying the specific factor being measured.",
+        "measure_text": "Human-readable name of the measured factor.",
+        "display_level": "Hierarchy level used with sort_sequence in BLS displays.",
+        "selectable": "Whether this item can be selected in query tools (T or F).",
+        "sort_sequence": "Sort order used with display_level in BLS displays.",
+    },
+    "pr.period": {
+        "period": "Code for the observation period; Q05 represents the annual average.",
+        "period_abbr": "Abbreviated label for the observation period.",
+        "period_name": "Human-readable name of the observation period.",
+    },
+    "pr.seasonal": {
+        "Seasonal_code": "Code indicating seasonal-adjustment status (S or U).",
+        "Seasonal_text": "Description of the seasonal-adjustment status.",
+    },
+    "pr.sector": {
+        "sector_code": "Code identifying the economic sector.",
+        "sector_name": "Human-readable name of the economic sector.",
+        "display_level": "Hierarchy level used with sort_sequence in BLS displays.",
+        "selectable": "Whether this item can be selected in query tools (T or F).",
+        "sort_sequence": "Sort order used with display_level in BLS displays.",
+    },
+    "pr.series": {
+        "series_id": "BLS identifier composed from survey and series dimension codes.",
+        "sector_code": "Code identifying the economy sector for the series.",
+        "class_code": "Code identifying the employee group for the series.",
+        "measure_code": "Code identifying the factor measured by the series.",
+        "duration_code": "Code identifying the measure's duration or comparison basis.",
+        "seasonal": "Code indicating whether the series is seasonally adjusted.",
+        "base_year": "Base year for the index presented, when applicable.",
+        "footnote_codes": "Comma-separated footnote codes applying to the series.",
+        "series_title": "Source-provided human-readable title for the series.",
+        "begin_year": "First year for which observations are available.",
+        "begin_period": "First observation period within begin_year.",
+        "end_year": "Last year for which observations are available.",
+        "end_period": "Last observation period within end_year.",
+    },
+}
+
+POPULATION_COLUMN_COMMENTS = {
+    "nation_id": "DataUSA identifier for the nation.",
+    "nation": "DataUSA human-readable nation name.",
+    "year": "Calendar year associated with the population estimate.",
+    "population": "Source-reported population count, retained as text in Bronze.",
+}
+
+QUARANTINE_COLUMN_COMMENTS = {
+    "source_name": "Source system from which the rejected record originated.",
+    "source_file": "Source filename associated with the rejected record.",
+    "raw_record": "Original record text or serialized source fields.",
+    "rejection_reason": "Reason the record was routed to quarantine.",
+    "rejected_at": "Timestamp when the quarantine row was generated.",
+    **INGESTION_COLUMN_COMMENTS,
+}
+
+
+def _schema_with_comments(
+    fields: list[tuple[str, str]], comments: dict[str, str]
+) -> str:
+    field_names = {name for name, _ in fields}
+    missing_comments = field_names - comments.keys()
+    if missing_comments:
+        raise ValueError(
+            f"Missing column comments for: {', '.join(sorted(missing_comments))}"
+        )
+    schema_fields = []
+    for name, data_type in fields:
+        comment = comments[name].replace("'", "''")
+        schema_fields.append(f"`{name}` {data_type} COMMENT '{comment}'")
+    return ",\n".join(schema_fields)
+
+
+def _bls_table_schema(filename: str) -> str:
+    source_fields = BLS_SCHEMAS[filename][0]
+    fields = [(name, "STRING") for name in source_fields]
+    fields.extend(
+        [("_snapshot_id", "STRING"), ("_ingested_at", "TIMESTAMP")]
+    )
+    comments = {
+        **BLS_COLUMN_COMMENTS[filename],
+        **INGESTION_COLUMN_COMMENTS,
+    }
+    return _schema_with_comments(fields, comments)
+
+
 def _successful_file_index(
     source_name: str, source_file: str | None = None
 ) -> DataFrame:
@@ -172,11 +297,6 @@ def _read_bls_tsv(
     return dataframe
 
 
-def _read_bls_text(filename: str) -> DataFrame:
-    dataframe = spark.read.text(f"{BLS_PATH}/snapshots/*/{filename}")
-    return _with_snapshot_metadata(dataframe, "BLS", filename)
-
-
 def _read_population() -> DataFrame:
     record_schema = StructType(
         [
@@ -234,7 +354,7 @@ def _quarantine_rows(
     source_name: str,
     source_file: str,
     source_columns: list[str],
-    required_column: str,
+    required_column: str | None,
     corrupt_column: str | None = None,
 ) -> DataFrame:
     malformed = (
@@ -242,8 +362,10 @@ def _quarantine_rows(
         if corrupt_column
         else F.lit(False)
     )
-    missing_key = F.col(required_column).isNull() | (
-        F.trim(F.col(required_column)) == ""
+    missing_key = (
+        F.col(required_column).isNull() | (F.trim(F.col(required_column)) == "")
+        if required_column
+        else F.lit(False)
     )
     raw_record = F.coalesce(
         F.col(corrupt_column) if corrupt_column else F.lit(None).cast("string"),
@@ -265,69 +387,110 @@ def _quarantine_rows(
     )
 
 
-@dp.materialized_view(name="pr_class", comment="Raw BLS class lookup.")
+@dp.materialized_view(
+    name="pr_class",
+    comment="Source BLS class codes, descriptions, and display-order attributes.",
+    schema=_bls_table_schema("pr.class"),
+)
 def pr_class():
     return _read_bls_tsv("pr.class")
 
 
-@dp.materialized_view(name="pr_data_0_current", comment="Raw BLS current observations.")
+@dp.materialized_view(
+    name="pr_data_0_current",
+    comment="Source BLS year-to-date productivity observations in TSV form.",
+    schema=_bls_table_schema("pr.data.0.Current"),
+)
 def pr_data_0_current():
     return _read_bls_tsv("pr.data.0.Current")
 
 
-@dp.materialized_view(name="pr_data_1_alldata", comment="Raw historical BLS observations.")
+@dp.materialized_view(
+    name="pr_data_1_alldata",
+    comment="Source BLS productivity observations across all available years.",
+    schema=_bls_table_schema("pr.data.1.AllData"),
+)
 def pr_data_1_alldata():
     return _read_bls_tsv("pr.data.1.AllData")
 
 
-@dp.materialized_view(name="pr_contacts", comment="Raw BLS contacts document lines.")
-def pr_contacts():
-    return _read_bls_text("pr.contacts")
-
-
-@dp.materialized_view(name="pr_duration", comment="Raw BLS duration lookup.")
+@dp.materialized_view(
+    name="pr_duration",
+    comment="Source BLS duration codes and their descriptions.",
+    schema=_bls_table_schema("pr.duration"),
+)
 def pr_duration():
     return _read_bls_tsv("pr.duration")
 
 
-@dp.materialized_view(name="pr_footnote", comment="Raw BLS footnote lookup.")
+@dp.materialized_view(
+    name="pr_footnote",
+    comment="Source BLS footnote codes and their explanatory text.",
+    schema=_bls_table_schema("pr.footnote"),
+)
 def pr_footnote():
     return _read_bls_tsv("pr.footnote")
 
 
-@dp.materialized_view(name="pr_measure", comment="Raw BLS measure lookup.")
+@dp.materialized_view(
+    name="pr_measure",
+    comment="Source BLS measure codes, descriptions, and display-order attributes.",
+    schema=_bls_table_schema("pr.measure"),
+)
 def pr_measure():
     return _read_bls_tsv("pr.measure")
 
 
-@dp.materialized_view(name="pr_period", comment="Raw BLS period lookup.")
+@dp.materialized_view(
+    name="pr_period",
+    comment="Source BLS observation-period codes and labels.",
+    schema=_bls_table_schema("pr.period"),
+)
 def pr_period():
     return _read_bls_tsv("pr.period")
 
 
-@dp.materialized_view(name="pr_seasonal", comment="Raw BLS seasonal adjustment lookup.")
+@dp.materialized_view(
+    name="pr_seasonal",
+    comment="Source BLS seasonal-adjustment codes and descriptions.",
+    schema=_bls_table_schema("pr.seasonal"),
+)
 def pr_seasonal():
     return _read_bls_tsv("pr.seasonal")
 
 
-@dp.materialized_view(name="pr_sector", comment="Raw BLS sector lookup.")
+@dp.materialized_view(
+    name="pr_sector",
+    comment="Source BLS economic-sector codes and descriptions.",
+    schema=_bls_table_schema("pr.sector"),
+)
 def pr_sector():
     return _read_bls_tsv("pr.sector")
 
 
-@dp.materialized_view(name="pr_series", comment="Raw BLS series metadata.")
+@dp.materialized_view(
+    name="pr_series",
+    comment="Source BLS time-series definitions, dimensions, and observed date bounds.",
+    schema=_bls_table_schema("pr.series"),
+)
 def pr_series():
     return _read_bls_tsv("pr.series")
 
 
-@dp.materialized_view(name="pr_txt", comment="Raw BLS documentation lines.")
-def pr_txt():
-    return _read_bls_text("pr.txt")
-
-
 @dp.materialized_view(
     name="population",
-    comment="Raw DataUSA population records with source fields stored as strings.",
+    comment="Source DataUSA population records with source values retained as strings.",
+    schema=_schema_with_comments(
+        [
+            ("nation_id", "STRING"),
+            ("nation", "STRING"),
+            ("year", "STRING"),
+            ("population", "STRING"),
+            ("_snapshot_id", "STRING"),
+            ("_ingested_at", "TIMESTAMP"),
+        ],
+        {**POPULATION_COLUMN_COMMENTS, **INGESTION_COLUMN_COMMENTS},
+    ),
 )
 def population():
     return _read_population()
@@ -335,7 +498,19 @@ def population():
 
 @dp.materialized_view(
     name="quarantine",
-    comment="Malformed Bronze records retained with snapshot traceability.",
+    comment="Malformed or key-incomplete source records retained with rejection reasons.",
+    schema=_schema_with_comments(
+        [
+            ("source_name", "STRING"),
+            ("source_file", "STRING"),
+            ("raw_record", "STRING"),
+            ("rejection_reason", "STRING"),
+            ("rejected_at", "TIMESTAMP"),
+            ("_snapshot_id", "STRING"),
+            ("_ingested_at", "TIMESTAMP"),
+        ],
+        QUARANTINE_COLUMN_COMMENTS,
+    ),
 )
 def quarantine():
     quarantine_frames = []
@@ -346,7 +521,7 @@ def quarantine():
                 "BLS",
                 filename,
                 columns,
-                key_column,
+                None if key_column == "series_id" else key_column,
                 "_corrupt_record",
             )
         )
@@ -357,7 +532,7 @@ def quarantine():
             "DataUSA",
             "population.json",
             ["nation_id", "nation", "year", "population"],
-            "nation_id",
+            None,
         )
     )
 

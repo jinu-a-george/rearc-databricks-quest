@@ -2,33 +2,52 @@ WITH annual_totals AS (
     SELECT
         series_id,
         year,
-        SUM(value) AS annual_value
+        _snapshot_id,
+        SUM(value) AS annual_value,
+        COUNT(*) AS observation_count,
+        COUNT(DISTINCT period) AS distinct_quarter_count
     FROM rearc_catalog.data_quest_silver.bls_productivity
     WHERE period IN ('Q01', 'Q02', 'Q03', 'Q04')
-      AND _snapshot_id = (
-          SELECT MAX(_snapshot_id)
-          FROM rearc_catalog.data_quest_silver.bls_productivity
-      )
-    GROUP BY series_id, year
+    GROUP BY series_id, year, _snapshot_id
+    HAVING COUNT(*) = 4
+       AND COUNT(DISTINCT period) = 4
 ),
 ranked_years AS (
     SELECT
         series_id,
         year,
+        _snapshot_id,
         annual_value,
-        ROW_NUMBER() OVER (
-            PARTITION BY series_id
-            ORDER BY annual_value DESC, year ASC
+        observation_count,
+        DENSE_RANK() OVER (
+            PARTITION BY series_id, _snapshot_id
+            ORDER BY annual_value DESC
         ) AS year_rank
     FROM annual_totals
+),
+winning_years AS (
+    SELECT
+        series_id,
+        year,
+        _snapshot_id,
+        annual_value,
+        observation_count
+    FROM ranked_years
+    WHERE year_rank = 1
 )
 SELECT
-    ranked.series_id,
-    ranked.year AS best_year,
-    ranked.annual_value,
-    series.series_description
-FROM ranked_years AS ranked
+    winners.series_id,
+    series.series_description,
+    CAST(winners.year AS INT) AS winning_year,
+    CAST(winners.annual_value AS DOUBLE) AS annual_value,
+    CAST(winners.observation_count AS INT) AS quarterly_observation_count,
+    winners._snapshot_id,
+    CURRENT_TIMESTAMP() AS _calculated_at
+FROM winning_years AS winners
 LEFT JOIN rearc_catalog.data_quest_silver.bls_series AS series
-    ON ranked.series_id = series.series_id
-   AND series.is_current
-WHERE ranked.year_rank = 1;
+  ON winners.series_id = series.series_id
+ AND series.valid_from_snapshot_id <= winners._snapshot_id
+ AND (
+        series.valid_to_snapshot_id IS NULL
+        OR series.valid_to_snapshot_id > winners._snapshot_id
+     );
