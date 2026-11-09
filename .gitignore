@@ -8,3 +8,5 @@ __pycache__/
 .github
 data/source_inspection/
 .vscode/
+.cursor/
+.databricks/

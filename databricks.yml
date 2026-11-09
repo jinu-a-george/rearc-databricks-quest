@@ -29,7 +29,7 @@ resources:
   jobs:
     setup_environment:
       name: rearc-data-quest-environment-setup
-      description: Creates the Unity Catalog catalog, schemas, and raw volume.
+      description: One-time bootstrap for Unity Catalog schemas, raw volume, audit table, and Gold analyst grants.
       tasks:
         - task_key: create_catalog_schemas_and_volume
           sql_task:
@@ -41,6 +41,9 @@ resources:
       name: rearc-data-quest-data-pipeline
       description: Monitors and snapshots sources, then refreshes Bronze, Silver, and Gold.
       max_concurrent_runs: 1
+      parameters:
+        - name: force_publish
+          default: "false"
       schedule:
         quartz_cron_expression: ${var.monitor_cron_expression}
         timezone_id: UTC
@@ -65,6 +68,8 @@ resources:
               - "{{job.id}}"
               - --job-run-id
               - "{{job.run_id}}"
+              - --force-publish
+              - "{{job.parameters.force_publish}}"
               - --project-root
               - ${workspace.file_path}
           environment_key: ingestion
