@@ -58,7 +58,7 @@ The job runs weekly (Monday at 06:00 UTC by default) and permits one concurrent 
 
 ### Bronze
 
-Bronze consists of source-oriented materialized views in `rearc_catalog.data_quest_bronze`. The current pipeline defines ten BLS tabular source views and one DataUSA population view. The complete discovered directory—including text-only reference files such as `pr.txt` and `pr.contacts`—is retained in the Volume, but text-only documents do not have structured Bronze tables. A separate Bronze `quarantine` view exposes malformed BLS TSV records and missing required keys in BLS lookup files.
+Bronze consists of source-oriented materialized views in `rearc_catalog.data_quest_bronze`. The current pipeline defines ten BLS tabular source views and one DataUSA population view. The complete discovered directory—including text-only reference files such as `pr.txt` and `pr.contacts`—is retained in the Volume, but the two text-only documents do not have structured Bronze tables. They are plain-text documents with no keys, headers, or consistent columns, so a tabular Bronze representation would add no queryable value beyond the preserved originals. `pr.txt` is not unused: its field-definition sections guided the profiling of each TSV and became the wording for the table and column comments declared throughout Bronze, Silver, and Gold. A separate Bronze `quarantine` view exposes malformed BLS TSV records and missing required keys in BLS lookup files.
 
 BLS TSV fields and parsed DataUSA record fields are kept as strings in Bronze. This preserves source representations and leaves business type conversion to Silver. The original DataUSA JSON envelope remains in the Volume; the Bronze reader extracts its records and preserves the population number's source representation as text. `pr.data.0.Current` and `pr.data.1.AllData` are loaded independently and never blindly unioned. Source profiling confirmed the overlap precisely: every one of `pr.data.0.Current`'s 46,159 observations for 1995–2026 is also present in `pr.data.1.AllData` (92,328 rows), so Current is a complete subset of the historical file. Silver types only the AllData file—a union of the two would double-count every shared observation, and the complete history is what the annual ranking needs. Current remains preserved as its own source-shaped Bronze table for completeness of the discovered directory; it is not part of the Silver curation path.
 
@@ -153,7 +153,7 @@ For committed snapshot `20261109103858915519` (forced run `583718480677949`), th
 | `population.json` | 11 | 11 |
 | **Total** | **138,877** | **138,877** |
 
-The directory's two text-only documents, `pr.contacts` (11 lines) and `pr.txt` (279 lines), add 290 downloaded records with no Bronze table by design, so the full inventory is 139,167 validated source records.
+The directory's two text-only documents, `pr.contacts` (11 lines) and `pr.txt` (279 lines), add 290 downloaded records with no Bronze table by design (plain-text reference documents; see the Bronze section), so the full inventory is 139,167 validated source records.
 
 After the Silver expectations were moved from hand-written prefilters to declarative `@dp.expect_all_or_drop`, forced run `583718480677949` re-ingested and refreshed all three pipelines successfully. Both quarantine tables reported zero rows, curated Silver datasets retained one dataset per committed snapshot, and `bls_series` collapsed the three identical snapshots into one observed metadata version per series, confirming the SCD derivation and the retention design live.
 
