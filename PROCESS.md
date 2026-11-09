@@ -130,6 +130,8 @@ Local validation passed with 13 unit tests and Python compilation, and `databric
 
 Runtime findings from the first live deployments were fixed and the affected workflows rerun: Unity Catalog's prohibition on `input_file_name()` (replaced with `_metadata.file_path`), a workspace pipeline module that could not import the local `src` package (the DAB now supplies the project root), and audit row-count updates that must use the ingestion-attempt ID while the processing checkpoint uses the authoritative source snapshot ID.
 
+After the Silver expectations were moved from hand-written prefilters to declarative `@dp.expect_all_or_drop`, forced run `583718480677949` re-ingested and refreshed all three pipelines successfully. Both quarantine tables reported zero rows, curated Silver datasets retained one dataset per committed snapshot, and `bls_series` collapsed the three identical snapshots into one observed metadata version per series, confirming the SCD derivation and the retention design live.
+
 ## AI usage
 
 I used the GitHub Copilot free plan and ChatGPT while working through the assessment. I first used AI assistance to understand the sources and to shape the local source profiler, then reviewed the profile output and source documentation to confirm the actual fields, layouts, values, and data-quality concerns. I had an initial architecture in mind and used ChatGPT to challenge and refine the design and trade-offs.
