@@ -72,4 +72,4 @@ python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-`tools/local_source_profiler.py` is a one-time local exploration utility. It downloads originals to `data/source_inspection/` and produces `profile_report.json`; do not commit source data or credentials. See `PROCESS.md` for design choices, limitations, and the execution retrospective.
+`tools/local_source_profiler.py` is a one-time local exploration utility. It downloads originals to `data/source_inspection/` and produces `profile_report.json`; the folder is gitignored, so these inspection artifacts are referenced by the documentation as local analysis inputs and are not part of the repository. Do not commit source data or credentials. See `PROCESS.md` for design choices, limitations, and the execution retrospective.
