@@ -162,21 +162,37 @@ Gold contains business-ready outputs for the population summary, annual producti
 
 *Population mean and standard deviation output for the requested period.*
 
+![Population statistics current view](screenshots/11.2-unity_catalog-data_quest_gold.population_statistics_current_view.png)
+
+*Current Gold view definition, filtered to the latest snapshot of the population statistics table.*
+
 ### Highest annual productivity per series
 
 ![Annual productivity ranking columns](screenshots/11.3-unity_catalog-data_quest_gold.productivity_annual_ranking_table_columns.png)
 
 *Output schema for the per-series annual productivity ranking.*
 
-![Annual productivity ranking result](screenshots/11.3-unity_catalog-data_quest_gold.productivity_annual_ranking_table_data.png)
+![Annual productivity ranking current view](screenshots/11.3-unity_catalog-data_quest_gold.productivity_annual_ranking_current_view.png)
+
+*Current Gold view definition, filtered to the latest snapshot of the annual ranking table.*
+
+![Annual productivity ranking result, first view](screenshots/11.3-unity_catalog-data_quest_gold.productivity_annual_ranking_table_data_01.png)
 
 *Selected highest annual productivity totals with series descriptions.*
+
+![Annual productivity ranking result, second view](screenshots/11.3-unity_catalog-data_quest_gold.productivity_annual_ranking_table_data_02.png)
+
+*Additional ranking output columns, including quarterly coverage and snapshot details.*
 
 ### Productivity with population
 
 ![Productivity-population comparison columns](screenshots/11.4-unity_catalog-data_quest_gold.productivity_population_comparison_table_columns.png)
 
 *Output schema for the target productivity-series and population comparison.*
+
+![Productivity-population comparison current view](screenshots/11.4-unity_catalog-data_quest_gold.productivity_population_comparison_current_view.png)
+
+*Current Gold view definition, filtered to the latest snapshot of the comparison table.*
 
 ![Productivity-population comparison, first view](screenshots/11.4-unity_catalog-data_quest_gold.productivity_population_comparison_table_data_01.png)
 
