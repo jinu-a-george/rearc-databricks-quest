@@ -1,53 +1,145 @@
-# Process and design notes
+# Process and Design Notes
 
 ## Architecture and data flow
 
-The DAB defines an environment setup job and a scheduled ingestion workflow. The workflow discovers BLS files dynamically, retrieves the complete DataUSA response, validates both sources, writes immutable snapshot directories under `/Volumes/rearc_catalog/data_quest_bronze/raw_data/`, and only then advances the root snapshot pointer. A condition task skips pipeline refreshes when the latest snapshot has already been processed.
+The solution is a snapshot-based batch workflow deployed with Databricks Asset Bundles (DABs). It uses the BLS productivity directory and the DataUSA annual population API as sources, Unity Catalog Volumes for immutable source files, and three Lakeflow Spark Declarative Pipelines for the Bronze, Silver, and Gold layers.
 
-Three serverless Lakeflow Spark Declarative Pipelines implement the layers:
+```mermaid
+flowchart TD
+    BLS[BLS directory listing and TSV files]
+    DATAUSA[DataUSA population API]
+    JOB[Weekly DAB workflow]
+    DOWNLOAD[Discover, download, validate, checksum]
+    VOLUME[Unity Catalog Volume: raw_data]
+    MANIFEST[Manifests and latest.json]
+    BRONZE[Bronze materialized views]
+    SILVER[Silver materialized views and quarantine]
+    GOLD[Gold analytical materialized views]
+    AUDIT[pipeline_job_details audit table]
+    SQL[Spark SQL alternatives]
+    ANALYST[Read-only Gold analysts]
 
-- **Bronze** parses source formats while retaining source values and appending `_snapshot_id` and `_ingested_at` as the final columns. File path, checksum, HTTP, and job metadata are held once per source file in `pipeline_job_details`. It loads only committed snapshots and retains successful snapshot history.
-- **Silver** casts and validates all committed productivity and population snapshots into `bls_productivity`, `bls_series`, and `population`. `bls_series` enriches series metadata with sector, class, measure, duration, and seasonal descriptions, then derives system-observed SCD Type 2 versions from attribute hashes and snapshot IDs. The fact tables retain snapshot keys so revised observations are not overwritten. Invalid rows are retained and surfaced through expectations; malformed records and missing identifiers are also represented in quarantine.
-- **Gold** materializes `population_statistics`, `best_productivity_year_by_series`, and `target_series_with_population`, using the existing canonical PySpark transformations.
+    BLS --> JOB
+    DATAUSA --> JOB
+    JOB --> DOWNLOAD
+    DOWNLOAD --> VOLUME
+    DOWNLOAD --> MANIFEST
+    DOWNLOAD --> AUDIT
+    VOLUME --> BRONZE
+    MANIFEST --> BRONZE
+    BRONZE --> SILVER
+    SILVER --> GOLD
+    SILVER --> SQL
+    GOLD --> ANALYST
+```
 
-The `pipeline_job_details` table has one row per source file and ingestion attempt. Its source `status` is `SUCCESS` (file downloaded and validated), `UNCHANGED` (source validators or checksums match the prior copy), or `FAILED` (download or validation failed). Its `snapshot_status` is the overall coordinated attempt status: `SUCCESS`, `UNCHANGED`, or `FAILED`. The final workflow task counts Bronze rows per file and updates the processing pointer only after all three pipelines succeed. This makes an unchanged source retryable when a prior downstream run failed.
+### Source discovery, snapshots, and repeat runs
 
-## Source and schema decisions
+Before designing the transformations, I reviewed the assessment requirements and inspected both source systems. I downloaded source copies locally for exploration and ran [`tools/local_source_profiler.py`](./tools/local_source_profiler.py). It profiles delimited files and DataUSA JSON for headers, delimiters, row and malformed-row counts, nulls and blanks, candidate data types, type mismatches, and suspicious characters. It also checks BLS observation keys, overlap between `pr.data.0.Current` and `pr.data.1.AllData`, lookup references, the target series, and year/period patterns. This helped me confirm the source layouts and choose the Bronze, Silver, and Gold schemas. Local copies are for inspection only; the deployed workflow downloads directly into the Unity Catalog Volume.
 
-BLS files are tab-separated; their discovered inventory is recorded in the manifest. Known tabular files use headers confirmed by `data/source_inspection/profile_report.json`. Every discovered original remains preserved in the Volume, but only the inspected source schemas become typed Bronze tables; there is no duplicate catch-all `bls_raw_records` table. `pr.data.0.Current` and `pr.data.1.AllData` are loaded independently. DataUSA's original JSON envelope is preserved in the Volume; its record fields are normalized for Delta table compatibility.
+The `download_source_files` task dynamically discovers files from the BLS directory listing and retrieves the complete DataUSA JSON response. It uses a `requests.Session`, a contact-bearing BLS User-Agent, bounded retries for transient errors, explicit timeouts, streamed downloads, temporary files, and validation before promotion. It rejects invalid JSON, empty files, HTML returned in place of BLS data, and changed headers for known tabular files. Download failures are surfaced and do not advance the committed snapshot.
 
-Bronze is source-shaped and keeps source fields as strings rather than applying business cleanup. For DataUSA population, Bronze quotes the numeric token in the raw JSON text before parsing records, preserving the original string form (such as `325719178.0`) instead of Spark's exponent-format rendering. Only `_snapshot_id` and `_ingested_at` are added to each Bronze table, at the end of the schema. `pipeline_job_details` contains source file/path/checksum and job/run details, avoiding per-row duplication. Silver owns type conversion and data quality. Population values are cast through `DECIMAL(20,1)` before converting to integer counts. The root `latest.json` is the authoritative commit marker; source-specific pointers are informational. A candidate manifest can exist without being consumable if promotion did not reach the root pointer. Snapshot IDs are fixed-width UTC timestamps, so lexical ordering lets Bronze exclude manifests newer than the committed snapshot.
+Each coordinated attempt gets a fixed-width UTC `snapshot_id`. Source files are first staged and then promoted to:
 
-The raw Volume is in the existing `data_quest_bronze` schema; there is no separate `data_quest` schema. The one-time migration removes the obsolete `data_quest` schema/Volume and clears prior contents from the target raw Volume before the new initial snapshot. Setup does not perform those destructive operations on subsequent runs.
+```text
+/Volumes/rearc_catalog/data_quest_bronze/raw_data/
+├── bls/snapshots/<snapshot_id>/
+├── population/snapshots/<snapshot_id>/population.json
+├── manifests/<snapshot_id>.json
+├── latest.json
+└── processing/latest.json
+```
 
-The series dimension is system-observed SCD Type 2: `valid_from_snapshot_id` is the first snapshot where an attribute hash was observed, and `valid_to_snapshot_id` is the next snapshot where a different hash appeared. These are observation boundaries, not source-provided effective dates. The two fact tables retain a row per business key and snapshot so revisions in productivity or population are not overwritten.
+The source originals are not modified. A manifest records the discovered source inventory, paths, URLs, download timestamps, sizes, checksums, and status. The root `latest.json` is the authoritative commit marker; an incomplete or failed attempt cannot replace it. The separate `processing/latest.json` marker records which committed snapshot has completed all downstream pipelines and audit finalization.
 
-The monitor uses BLS directory discovery and HEAD metadata where available. It downloads all sources if metadata is incomplete or differs, then compares SHA-256 checksums. This favors a coordinated, reproducible snapshot over per-file incremental updates. When every discovered source has complete matching validators, it avoids downloading the files.
+Every scheduled run downloads the current source inventory and compares its checksums and file list against the latest successful manifest. If the inventory and checksums match, the attempt is marked unchanged and its staging files are removed. The workflow skips the pipelines only when that committed snapshot has already been processed. If processing previously failed, the unchanged committed snapshot remains eligible for a retry. If a file is added, removed, or changed, a new coordinated snapshot is committed and the Bronze, Silver, and Gold pipelines run. The optional `force_publish` parameter publishes a new snapshot and requests processing even when the checksums match.
 
-## Analytics
+The job runs weekly (Monday at 06:00 UTC by default) and permits one concurrent run to avoid overlapping snapshot promotion. The cadence is configurable through the bundle. This is a simple whole-source-batch design: a change to any source causes all three downstream pipelines to refresh.
 
-The population analysis computes population standard deviation across 2013–2018 and reports the number of distinct years so missing annual coverage is visible. The productivity ranking sums Q01–Q04 values by series and year, excluding Q05 (the annual-average period), then chooses the earliest year in the event of a tie. The target-series analysis uses a left join so a BLS year is not discarded when population is missing. Gold and SQL analyses select the latest coordinated snapshot while Silver retains historical snapshots. SQL and PySpark implementations are maintained in parallel.
+### Bronze
 
-## Data quality and operational trade-offs
+Bronze consists of source-oriented materialized views in `rearc_catalog.data_quest_bronze`. The current pipeline defines ten BLS tabular source views and one DataUSA population view. The complete discovered directory—including text-only reference files such as `pr.txt` and `pr.contacts`—is retained in the Volume, but text-only documents do not have structured Bronze tables. A separate Bronze `quarantine` view exposes malformed BLS TSV records and missing required keys in BLS lookup files.
 
-Download and schema validation failures stop the ingestion task and do not advance the snapshot pointer. Bronze retains raw representations; its quarantine view identifies malformed TSV records and missing identifiers. Silver expectations retain invalid rows while recording expectation metrics, rather than silently dropping data. The separate audit table records source status, checksums, timestamps, downloaded record counts, and post-pipeline ingested row counts.
+BLS TSV fields and parsed DataUSA record fields are kept as strings in Bronze. This preserves source representations and leaves business type conversion to Silver. The original DataUSA JSON envelope remains in the Volume; the Bronze reader extracts its records and preserves the population number's source representation as text. `pr.data.0.Current` and `pr.data.1.AllData` are loaded independently; they are not blindly unioned because their observations can overlap.
 
-The source metadata optimization depends on upstream ETag, Last-Modified, and Content-Length values being complete and reliable. If not, the workflow falls back to full downloads and checksum comparison. The pipeline uses batch materialized views because the workflow creates complete coordinated snapshots. This is intentionally simpler than file-level streaming or a change-data-capture design for this assignment.
+Each Bronze data row has `_snapshot_id` and `_ingested_at` as its final columns. The snapshot ID links the row to its committed source version; the ingestion timestamp records when that source file was downloaded. File-level metadata is kept in the operational `rearc_catalog.data_quest_bronze.pipeline_job_details` table rather than repeated on every row.
 
-The weekly default schedule is configurable. Workspace permissions, Free Edition features, and serverless Python task behavior must be verified in the target workspace; successful local validation is not evidence that a Databricks run completed.
+The audit table has one row per source file and ingestion attempt. It records the attempt and source snapshot IDs, Databricks job and run IDs when available, source name, filename, URL and Volume path, SHA-256 checksum, file size, HTTP status, download timestamps, downloaded and ingested record counts, source status, overall snapshot status, and any error message. `SUCCESS`, `UNCHANGED`, and `FAILED` describe a file attempt; `snapshot_status` describes the coordinated attempt. After the pipelines complete, the final workflow task updates the ingested counts and advances the processing marker. This ties a row's `_snapshot_id` to the source files and the Databricks run that produced it.
+
+### Silver
+
+Silver is implemented as three curated materialized views—`bls_productivity`, `bls_series`, and `population`—plus a supporting `quarantine` view. The curated views retain the source snapshot columns so that revisions from later source snapshots do not overwrite history.
+
+- **`bls_productivity`** reads `pr_data_1_alldata`, trims text, casts `year` to `INT` and `value` to `DECIMAL(20, 6)`, and retains the series ID, period, footnote codes, snapshot ID, and ingestion timestamp.
+- **`bls_series`** joins each `pr.series` snapshot to its sector, class, measure, duration, and seasonal lookup rows from that same snapshot. It creates a human-readable description and derives system-observed SCD Type 2 versions using an attribute hash and snapshot IDs. These snapshot boundaries indicate when a metadata version was observed by this pipeline; they are not business-effective dates supplied by BLS.
+- **`population`** standardizes the DataUSA fields, casts year to `INT`, and converts the numeric population through `DECIMAL(20, 1)` to `BIGINT`. The nation and snapshot identifiers remain available for validation and lineage.
+
+The expectations validate required identifiers and snapshot keys, positive years, supported period codes, numeric values, valid series metadata, and non-negative population. The Silver transformation also filters rows against these rules before exposing the curated tables. Rows that fail are written to the Silver `quarantine` view with the source table and file, serialized raw record, snapshot metadata, rejection timestamp, and all failed expectation names. Bronze raw files are retained, so rejected rows can be inspected and reprocessed after a code or source correction. Quarantine is a diagnostic dataset, not an automated remediation process.
+
+Bronze quarantine handles malformed TSV rows and missing identifiers in BLS lookup files. Required BLS observation `series_id` and DataUSA `nation_id` validation is applied in Silver. The curated Silver facts and the quarantined records are separate outputs; a rejected record is not silently allowed into a curated table.
+
+### Gold and analytics
+
+Gold contains three business-facing materialized views in `rearc_catalog.data_quest_gold`. All three retain results for every Silver source snapshot and include `_snapshot_id` and `_calculated_at`, so historical analytical outputs remain reproducible.
+
+1. **`population_statistics`** reports one row per nation and snapshot. It filters each snapshot's population to 2013–2018 inclusive and calculates the average and **population** standard deviation from unique, non-null annual records. It also reports `observation_count`; the mean and standard deviation are populated only when all six years are present, and missing years are never replaced with zero.
+2. **`productivity_annual_ranking`** sums Q01–Q04 values by series, year, and snapshot, excluding Q05 (an annual-average period, not a quarter). Years are only ranked when they contain exactly one observation for each of the four quarters. `DENSE_RANK` ranks the annual totals and all years tied for the highest sum are retained. Each row is enriched with the human-readable BLS series description that was valid for that snapshot, using the `bls_series` SCD boundaries.
+3. **`productivity_population_comparison`** selects `PRS30006032` Q01 observations and left-joins population by year and coordinated snapshot ID. This retains BLS observations even when population is missing, and an explicit `population_available` flag records availability. The analyst-facing result contains the series ID, snapshot-current series description, year, period, productivity value, nation, and population.
+
+PySpark transformations in [`src/pipeline/analytics.py`](./src/pipeline/analytics.py) are the primary implementation feeding Gold. Equivalent Spark SQL is maintained in [`sql/analysis_1.sql`](./sql/analysis_1.sql), [`sql/analysis_2.sql`](./sql/analysis_2.sql), and [`sql/analysis_3.sql`](./sql/analysis_3.sql) as a secondary implementation and for direct validation. Keeping both implementations makes the calculations accessible to DataFrame and SQL users while making it possible to compare their outputs.
+
+### Deployment and access control
+
+The DAB configuration in [`databricks.yml`](./databricks.yml) defines a one-time `setup_environment` job, a scheduled ingestion-and-load job, and separate serverless Bronze, Silver, and Gold pipelines. The setup SQL creates the three layer schemas, the raw Volume, and the audit table. It grants the existing `grp_rearc_data_quest_analyst_readonly` Unity Catalog group `USE CATALOG` on `rearc_catalog`, and `USE SCHEMA` plus `SELECT` on the Gold schema. It does not grant this analyst group access to Bronze, Silver, or the raw Volume. The group must exist before setup, and the identity running setup must have permission to grant access.
+
+Deployment and execution from PowerShell, at the repository root:
+
+```powershell
+$env:BUNDLE_VAR_bls_contact_email = "your-contact-email@example.com"
+databricks bundle validate -t dev
+databricks bundle deploy -t dev
+databricks bundle run setup_environment -t dev
+databricks bundle run bronze_ingestion_and_load -t dev
+```
+
+The contact email is provided at deployment/runtime and is not stored as a credential in the bundle. Run setup once after deployment; the scheduled workflow does not repeat environment bootstrap.
+
+## Trade-offs and limitations
+
+### Source change detection and processing scope
+
+Event-driven source notifications would be preferable in a production integration, but these public sources do not provide a notification mechanism for this project. A metadata-only polling approach using HTTP `HEAD` fields such as `Last-Modified`, `ETag`, and `Content-Length` was investigated. The observed BLS metadata differed and led to downloads even where file checksums matched; the DataUSA response did not provide the metadata needed for a reliable fast path. The current implementation therefore downloads and validates the sources, then compares SHA-256 checksums. This costs more network bandwidth but bases change detection on file contents and detects source inventory changes.
+
+The default weekly schedule is a reasonable starting point for the apparent update cadence of these datasets, not a claim about their official refresh guarantees. For a client, I would first confirm the source publication cadence and business freshness requirement, then schedule accordingly.
+
+For assessment simplicity, any changed file triggers the full coordinated batch: download, Bronze, Silver, and Gold. A production design should consider tracking changes at the individual file or source level and refreshing only dependent tables, once the lineage and recovery model make that safe. That would reduce unnecessary compute and processing as sources and tables grow.
+
+### Storage, schema, and performance
+
+The data volume does not currently justify partitioning or liquid clustering. If the BLS productivity fact grows, `bls_productivity` is the first table I would evaluate for liquid clustering on `series_id` and `year`, which align with the series-specific and annual aggregation query patterns. I would not initially cluster `bls_series` or `population`, which are comparatively small reference/fact datasets in the current profile.
+
+The project does not implement a general schema-evolution policy. Known BLS tabular sources have expected headers and a changed header causes ingestion validation to fail; dynamically discovered files without a defined Bronze schema remain preserved as originals but are not automatically promoted into a typed table. New, removed, renamed, or structurally changed fields require deliberate detection, schema review, and code changes. A production extension should alert on drift, preserve unexpected fields or records, and define whether each change is compatible, quarantined, or blocking.
+
+The full source snapshot is intentionally retained to make replay and audit possible. Retention and cleanup are not automatic: interrupted ingestion may leave a staging directory, and a production deployment should add a reviewed retention policy that never removes the latest committed or unprocessed snapshot.
 
 ## Validation and deployment record
 
-Local validation passed with 16 unit tests, Python compilation, and `databricks bundle validate -t dev`. The environment setup job completed successfully. Workflow run `188330031364843` completed ingestion, Bronze, Silver, Gold, and finalization successfully. The committed snapshot is `20261106182546392457`; its processing marker records `SUCCESS` with `audit_finalized: true`. Audit verification covered 12 BLS files and 1 DataUSA response; the finalizer reconciled 139,292 BLS Bronze rows and 11 population rows. The workspace has 13 source-shaped Bronze tables (12 BLS tables and 1 DataUSA table), exactly three Silver tables, and three Gold analytics tables. Each source-shaped Bronze table has `_snapshot_id` and `_ingested_at`, without per-row `_source_*` columns. The obsolete `bls_raw_records` and `silver_bls_observations` materialized views were explicitly removed. Silver schema verification confirmed snapshot-preserving productivity and population facts and the SCD Type 2 series dimension. SQL-versus-Gold comparisons for all three analytics returned zero rows in both difference directions.
+Local validation passed with 13 unit tests and Python compilation, and `databricks bundle validate -t dev` succeeded. The environment setup job completed successfully, and deployed workflow run `188330031364843` completed ingestion, Bronze, Silver, Gold, and finalization successfully. The committed snapshot is `20261106182546392457`; its processing marker records `SUCCESS` with `audit_finalized: true`. Audit verification covered 12 BLS files and 1 DataUSA response; the finalizer reconciled 139,292 BLS Bronze rows and 11 population rows. The workspace has 13 source-shaped Bronze tables (12 BLS tables and 1 DataUSA table), exactly three curated Silver tables plus a Silver `quarantine` view, a Bronze `quarantine` view, and three Gold analytics tables. Each source-shaped Bronze table has `_snapshot_id` and `_ingested_at`, without per-row `_source_*` columns. Silver schema verification confirmed snapshot-preserving productivity and population facts and the SCD Type 2 series dimension. The Gold tables were later renamed to `population_statistics`, `productivity_annual_ranking`, and `productivity_population_comparison` and the workspace redeployed; the refreshed tables and pipeline runs are captured under [`SCREENSHOTS.md`](./SCREENSHOTS.md). SQL-versus-Gold comparisons for all three analytics returned zero rows in both difference directions.
 
-The first live pipeline update exposed Unity Catalog's prohibition on `input_file_name()`, which was replaced with `_metadata.file_path`. A later Gold update exposed that a workspace pipeline module could not import the local `src` package by default; the DAB now supplies the workspace project root. Final audit verification also confirmed that row-count updates must use the ingestion-attempt ID, while the processing checkpoint uses the authoritative source snapshot ID. Those runtime findings were fixed and the full workflow was rerun successfully.
-
-Add sanitized screenshots under `screenshots/` to demonstrate the successful ingestion, Volume layout, pipeline run, tables, and analytical outputs before submission.
+Runtime findings from the first live deployments were fixed and the affected workflows rerun: Unity Catalog's prohibition on `input_file_name()` (replaced with `_metadata.file_path`), a workspace pipeline module that could not import the local `src` package (the DAB now supplies the project root), and audit row-count updates that must use the ingestion-attempt ID while the processing checkpoint uses the authoritative source snapshot ID.
 
 ## AI usage
 
-AI assistance was used to review the existing repository, implement snapshot-aware ingestion and pipeline wiring, update tests and documentation, and reason about failure recovery. The implementation is checked against the source profile, mocked ingestion tests, bundle validation, and—after deployment—actual Databricks run and table results. Review the final changes and workspace outputs before submission.
+I used the GitHub Copilot free plan and ChatGPT while working through the assessment. I first used AI assistance to understand the sources and to shape the local source profiler, then reviewed the profile output and source documentation to confirm the actual fields, layouts, values, and data-quality concerns. I had an initial architecture in mind and used ChatGPT to challenge and refine the design and trade-offs.
 
-## Retrospective and future improvements
+I then used GitHub Copilot to help draft the DAB and pipeline implementation from that design. I configured the Databricks CLI locally to connect to the workspace and used the agent to deploy, diagnose pipeline issues, and iterate on the implementation. AI output was not treated as proof of correctness: I checked it against the source files and profile, unit tests, bundle validation, and Databricks pipeline and query results. I reviewed and corrected runtime issues as they surfaced, including workspace pipeline import behavior and Unity Catalog compatibility.
 
-After the Databricks run, record the Free Edition limitations or compatibility adjustments encountered and what was learned about coordinating source snapshots, pipeline dependencies, and retryable processing. Potential follow-ups include stronger schema-drift alerting, explicit expectations/quarantine policies for each dataset, and automated SQL-versus-PySpark output comparison.
+## Retrospective
+
+The hardest part was making source change detection, pipeline processing, and lineage behave as one recoverable unit. A successful download is not enough: a partial attempt must not become the latest source snapshot, and a committed snapshot must remain retryable if one of the downstream pipelines fails. Separating the source commit marker from the processing marker, recording per-file audit rows, and carrying `_snapshot_id` through Bronze and Silver made those states explicit.
+
+Profiling the real source files before modeling was also important. It confirmed the BLS TSV schemas, showed why the current and historical productivity files must remain separate, and helped distinguish quarterly observations from the annual-average period. That groundwork made the Silver types and the three Gold calculations easier to explain and validate.
+
+The project was validated locally with the ingestion unit tests, Python compilation, and DAB bundle validation. The recorded Databricks validation includes a successful end-to-end workflow through ingestion, Bronze, Silver, Gold, and finalization; source-file audit/count reconciliation; and SQL comparisons against the Gold analytics with no row differences. These results validate the current implementation in the tested workspace, but do not guarantee that another workspace has the same permissions or platform behavior.
+
+With more time, I would add a deliberate schema-drift and alerting policy, increase isolated tests for transformation edge cases, automate SQL/PySpark result comparison, and assess source-level incremental refreshes and retention. Sanitized screenshots of ingestion, the Volume, the pipeline runs and tables, Genie-agent answers, and each analytical output are captured under `screenshots/` and indexed in [`SCREENSHOTS.md`](./SCREENSHOTS.md).
