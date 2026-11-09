@@ -88,6 +88,29 @@ Gold contains three business-facing materialized views in `rearc_catalog.data_qu
 2. **`productivity_annual_ranking`** sums Q01–Q04 values by series, year, and snapshot, excluding Q05 (an annual-average period, not a quarter). Years are only ranked when they contain exactly one observation for each of the four quarters. `DENSE_RANK` ranks the annual totals and all years tied for the highest sum are retained. Each row is enriched with the human-readable BLS series description that was valid for that snapshot, using the `bls_series` SCD boundaries.
 3. **`productivity_population_comparison`** selects `PRS30006032` Q01 observations and left-joins population by year and coordinated snapshot ID. This retains BLS observations even when population is missing, and an explicit `population_available` flag records availability. The analyst-facing result contains the series ID, snapshot-current series description, year, period, productivity value, nation, and population.
 
+Because Gold retains results for every Silver source snapshot, a Gold table contains one result set per committed snapshot rather than only the newest one. Downstream consumers therefore have two supported ways to read current values. The first is to filter to the newest snapshot in the query: snapshot IDs are fixed-width UTC timestamps, so `MAX(_snapshot_id)` returns the latest result set and needs no casting because lexical order equals numeric order.
+
+```sql
+SELECT *
+FROM rearc_catalog.data_quest_gold.productivity_population_comparison
+WHERE _snapshot_id = (
+    SELECT MAX(_snapshot_id) FROM rearc_catalog.data_quest_gold.productivity_population_comparison
+);
+```
+
+The second is to expose that filter once as a `*_current` view for convenience (this pattern was verified on the deployed workspace; the bundle itself does not create such views, so the base tables remain the complete, reproducible snapshot history):
+
+```sql
+CREATE OR REPLACE VIEW rearc_catalog.data_quest_gold.productivity_population_comparison_current AS
+SELECT *
+FROM rearc_catalog.data_quest_gold.productivity_population_comparison
+WHERE _snapshot_id = (
+    SELECT MAX(_snapshot_id) FROM rearc_catalog.data_quest_gold.productivity_population_comparison
+);
+```
+
+Keeping snapshot retention in the base tables and making current-value reads a filter or view decision preserves full reproducibility without duplicating storage.
+
 PySpark transformations in [`src/pipeline/analytics.py`](./src/pipeline/analytics.py) are the primary implementation feeding Gold, chosen so that all three answers share one typed module with unit-testable DataFrame logic and window functions. Equivalent Spark SQL is maintained in [`sql/analysis_1.sql`](./sql/analysis_1.sql), [`sql/analysis_2.sql`](./sql/analysis_2.sql), and [`sql/analysis_3.sql`](./sql/analysis_3.sql) as a secondary implementation and for direct validation. Keeping both implementations makes the calculations accessible to DataFrame and SQL users while making it possible to compare their outputs.
 
 ### Measurement semantics and edge cases
@@ -112,6 +135,10 @@ databricks bundle run bronze_ingestion_and_load -t dev
 
 The contact email is provided at deployment/runtime and is not stored as a credential in the bundle. Run setup once after deployment; the scheduled workflow does not repeat environment bootstrap.
 
+### Genie agent space for Gold data
+
+As a bonus capability, a native Databricks Genie space is configured over the three Gold tables so that business users can ask natural-language questions without querying the pipeline layers directly. The space description states the dataset scope and suggests example questions. Its instructions cover the semantics a questioner is most likely to miss: Gold results exist per source snapshot, so the agent must interpret which snapshot a question refers to; the Gold measures are pre-aggregated analytics, not raw facts to re-derive; the annual ranking sums Q01–Q04 per series-year with complete quarters required and retains tied peak years; and the agent should stay within the scope of the three loaded Gold tables. Sample questions and answers are captured under the Genie section of [`SCREENSHOTS.md`](./SCREENSHOTS.md). Because the space reads only the analyst-granted Gold tables, it inherits the access-control model instead of widening it; it does not need Bronze, Silver, or Volume access.
+
 ## Trade-offs and limitations
 
 ### Source change detection and processing scope
@@ -132,7 +159,7 @@ The full source snapshot is intentionally retained to make replay and audit poss
 
 ## Validation and deployment record
 
-Local validation passed with 13 unit tests and Python compilation, and `databricks bundle validate -t dev` succeeded. The environment setup job completed successfully, and deployed workflow run `188330031364843` completed ingestion, Bronze, Silver, Gold, and finalization successfully. The committed snapshot is `20261106182546392457`; its processing marker records `SUCCESS` with `audit_finalized: true`. Audit verification covered 12 BLS files and 1 DataUSA response; the finalizer reconciled 139,292 BLS Bronze rows and 11 population rows. The workspace has 13 source-shaped Bronze tables (12 BLS tables and 1 DataUSA table), exactly three curated Silver tables plus a Silver `quarantine` view, a Bronze `quarantine` view, and three Gold analytics tables. Each source-shaped Bronze table has `_snapshot_id` and `_ingested_at`, without per-row `_source_*` columns. Silver schema verification confirmed snapshot-preserving productivity and population facts and the SCD Type 2 series dimension. The Gold tables were later renamed to `population_statistics`, `productivity_annual_ranking`, and `productivity_population_comparison` and the workspace redeployed; the refreshed tables and pipeline runs are captured under [`SCREENSHOTS.md`](./SCREENSHOTS.md). SQL-versus-Gold comparisons for all three analytics returned zero rows in both difference directions.
+Local validation passed with 13 unit tests and Python compilation, and `databricks bundle validate -t dev` succeeded. The environment setup job completed successfully, and deployed workflow run `188330031364843` completed ingestion, Bronze, Silver, Gold, and finalization successfully. The committed snapshot is `20261106182546392457`; its processing marker records `SUCCESS` with `audit_finalized: true`. Audit verification covered 12 BLS files and 1 DataUSA response; the finalizer reconciled 139,292 BLS Bronze rows and 11 population rows. That run's workspace had 13 source-shaped Bronze tables (12 BLS and 1 DataUSA, including line-record views over the two text-only documents that were later retired), three curated Silver tables plus a Silver `quarantine` view, a Bronze `quarantine` view, and three Gold analytics tables. Each source-shaped Bronze table has `_snapshot_id` and `_ingested_at`, without per-row `_source_*` columns. Silver schema verification confirmed snapshot-preserving productivity and population facts and the SCD Type 2 series dimension. The Gold tables were later renamed to `population_statistics`, `productivity_annual_ranking`, and `productivity_population_comparison` and the workspace redeployed; the refreshed tables and pipeline runs are captured under [`SCREENSHOTS.md`](./SCREENSHOTS.md). SQL-versus-Gold comparisons for all three analytics returned zero rows in both difference directions.
 
 Runtime findings from the first live deployments were fixed and the affected workflows rerun: Unity Catalog's prohibition on `input_file_name()` (replaced with `_metadata.file_path`), a workspace pipeline module that could not import the local `src` package (the DAB now supplies the project root), and audit row-count updates that must use the ingestion-attempt ID while the processing checkpoint uses the authoritative source snapshot ID.
 
@@ -156,6 +183,8 @@ For committed snapshot `20261109103858915519` (forced run `583718480677949`), th
 The directory's two text-only documents, `pr.contacts` (11 lines) and `pr.txt` (279 lines), add 290 downloaded records with no Bronze table by design (plain-text reference documents; see the Bronze section), so the full inventory is 139,167 validated source records.
 
 After the Silver expectations were moved from hand-written prefilters to declarative `@dp.expect_all_or_drop`, forced run `583718480677949` re-ingested and refreshed all three pipelines successfully. Both quarantine tables reported zero rows, curated Silver datasets retained one dataset per committed snapshot, and `bls_series` collapsed the three identical snapshots into one observed metadata version per series, confirming the SCD derivation and the retention design live.
+
+Current workspace composition, verified against `information_schema.tables` for snapshot `20261109103858915519`: `data_quest_bronze` holds 11 source-shaped tables (10 BLS and 1 DataUSA) plus the `quarantine` view and the `pipeline_job_details` audit table; `data_quest_silver` holds the three curated tables plus `quarantine`; `data_quest_gold` holds the three analytics tables. Each schema also contains Lakeflow SDP service objects (`event_log_*` and internal `__materialization_mat_*` tables), including materializations left behind by retired dataset names; these are pipeline bookkeeping artifacts inherited from earlier iterations and are not part of the published data model.
 
 ## AI usage
 

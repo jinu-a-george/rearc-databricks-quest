@@ -98,7 +98,7 @@ The project stores source snapshots in a Unity Catalog Volume and loads source-s
 
 ![Bronze quarantine table](screenshots/08-unity_catalog-bronze.quarantine_table_columns.png)
 
-*Schema for Bronze records quarantined during initial validation.*
+*Schema of the Bronze `quarantine` table that exposes malformed BLS records and missing lookup identifiers.*
 
 ## Silver tables
 
@@ -234,7 +234,7 @@ These screenshots show the deployed jobs, the environment setup task, and the mu
 
 ## Genie Agent (bonus)
 
-The Genie Agent is configured to answer questions about the Gold productivity and population datasets.
+The Genie Agent is configured to answer questions about the Gold productivity and population datasets. Its configuration and rationale are documented in `PROCESS.md` and `README.md`.
 
 ![Genie Agent overview](screenshots/16.1-genie_agent-overview.png)
 

@@ -61,7 +61,23 @@ Silver contains `bls_productivity`, `bls_series`, `population`, and `quarantine`
 
 Gold retains results for every Silver source snapshot and includes `_snapshot_id` and `_calculated_at` in each output. `population_statistics` reports one row per nation/snapshot; statistics are populated only when there are six unique, non-null annual records for 2013–2018, and duplicate nation/year records are excluded from the calculation. `productivity_annual_ranking` excludes years without exactly one observation for each of Q01–Q04 and retains all years tied for the highest annual sum. `productivity_population_comparison` left-joins population by year and snapshot, retaining BLS observations with an availability flag when population is missing. A forced publish of unchanged source data creates a distinct snapshot, and Gold retains a separate result for it. The audit table also intentionally records a separate row per source file and ingestion attempt, so audit/history row counts are not expected to remain unchanged.
 
+Because Gold tables hold one result set per snapshot, read current values by filtering to the newest `_snapshot_id`; snapshot IDs are fixed-width UTC timestamps, so a text comparison selects the latest version without casting:
+
+```sql
+SELECT *
+FROM rearc_catalog.data_quest_gold.productivity_annual_ranking
+WHERE _snapshot_id = (
+    SELECT MAX(_snapshot_id) FROM rearc_catalog.data_quest_gold.productivity_annual_ranking
+);
+```
+
+For convenience, owners can layer `*_current` views with that same filter on top of the Gold tables; the bundle does not create such views, so the base tables remain the complete snapshot history.
+
 The population analysis uses `STDDEV_POP` for 2013–2018 and does not fill missing years with zero. Productivity annual sums exclude Q05 (the annual-average period), require a complete set of four quarters, and preserve ties. The target-series analysis returns `PRS30006032` Q01 observations with series description, productivity value, population, nation, and a population-availability indicator.
+
+## Genie agent (bonus)
+
+A Databricks Genie space is configured over the three Gold tables so analysts can ask natural-language questions about population statistics, annual productivity rankings, and the target-series comparison. Its instructions cover the per-snapshot results model, the pre-aggregated nature of Gold measures, tied peak years in the annual ranking, and the scope of the loaded datasets. Sample questions and answers are captured in [`SCREENSHOTS.md`](./SCREENSHOTS.md). The space reads only the analyst-granted Gold tables and inherits the existing access-control model.
 
 ## Local development and tests
 
@@ -69,7 +85,9 @@ The local Python environment is for unit tests and source inspection; it is not 
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
+python -m pytest tests -q
 ```
+
+The tests are `unittest` classes, so `python -m unittest discover -s tests -v` works as well; both report all test cases passing when `BLS_CONTACT_EMAIL` is set to any valid email in the environment.
 
 `tools/local_source_profiler.py` is a one-time local exploration utility. It downloads originals to `data/source_inspection/` and produces `profile_report.json`; the folder is gitignored, so these inspection artifacts are referenced by the documentation as local analysis inputs and are not part of the repository. Do not commit source data or credentials. See `PROCESS.md` for design choices, limitations, and the execution retrospective.
