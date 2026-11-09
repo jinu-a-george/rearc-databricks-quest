@@ -136,6 +136,25 @@ Local validation passed with 13 unit tests and Python compilation, and `databric
 
 Runtime findings from the first live deployments were fixed and the affected workflows rerun: Unity Catalog's prohibition on `input_file_name()` (replaced with `_metadata.file_path`), a workspace pipeline module that could not import the local `src` package (the DAB now supplies the project root), and audit row-count updates that must use the ingestion-attempt ID while the processing checkpoint uses the authoritative source snapshot ID.
 
+For committed snapshot `20261109103858915519` (forced run `583718480677949`), the per-file audit counts reconcile exactly with the Bronze rows carrying that `_snapshot_id`:
+
+| Source file | Audit `records_downloaded` | Bronze rows for the snapshot |
+| --- | ---: | ---: |
+| `pr.class` | 2 | 2 |
+| `pr.data.0.Current` | 46,159 | 46,159 |
+| `pr.data.1.AllData` | 92,328 | 92,328 |
+| `pr.duration` | 4 | 4 |
+| `pr.footnote` | 1 | 1 |
+| `pr.measure` | 22 | 22 |
+| `pr.period` | 5 | 5 |
+| `pr.seasonal` | 2 | 2 |
+| `pr.sector` | 6 | 6 |
+| `pr.series` | 337 | 337 |
+| `population.json` | 11 | 11 |
+| **Total** | **138,877** | **138,877** |
+
+The directory's two text-only documents, `pr.contacts` (11 lines) and `pr.txt` (279 lines), add 290 downloaded records with no Bronze table by design, so the full inventory is 139,167 validated source records.
+
 After the Silver expectations were moved from hand-written prefilters to declarative `@dp.expect_all_or_drop`, forced run `583718480677949` re-ingested and refreshed all three pipelines successfully. Both quarantine tables reported zero rows, curated Silver datasets retained one dataset per committed snapshot, and `bls_series` collapsed the three identical snapshots into one observed metadata version per series, confirming the SCD derivation and the retention design live.
 
 ## AI usage
