@@ -190,19 +190,6 @@ def _record_json(dataframe: DataFrame, columns: list[str]) -> Column:
     return F.to_json(F.struct(*[F.col(column) for column in columns]))
 
 
-def _passes_expectations(
-    dataframe: DataFrame, expectations: dict[str, str]
-) -> DataFrame:
-    valid = reduce(
-        lambda left, right: left & right,
-        [
-            F.coalesce(F.expr(condition), F.lit(False))
-            for condition in expectations.values()
-        ],
-    )
-    return dataframe.filter(valid)
-
-
 def _quarantine_rows(
     dataframe: DataFrame,
     source_name: str,
@@ -400,17 +387,9 @@ def _population_source() -> DataFrame:
     comment="Typed BLS productivity observations preserved by source snapshot.",
     schema=PRODUCTIVITY_SCHEMA,
 )
-@dp.expect(
-    "observation_key_required", PRODUCTIVITY_EXPECTATIONS["observation_key_required"]
-)
-@dp.expect("year_is_valid", PRODUCTIVITY_EXPECTATIONS["year_is_valid"])
-@dp.expect(
-    "period_is_valid", PRODUCTIVITY_EXPECTATIONS["period_is_valid"]
-)
-@dp.expect("value_is_numeric", PRODUCTIVITY_EXPECTATIONS["value_is_numeric"])
+@dp.expect_all_or_drop(PRODUCTIVITY_EXPECTATIONS)
 def bls_productivity():
-    source = _passes_expectations(_productivity_source(), PRODUCTIVITY_EXPECTATIONS)
-    return source.select(
+    return _productivity_source().select(
         "series_id",
         "year",
         "period",
@@ -426,16 +405,9 @@ def bls_productivity():
     comment="Snapshot-observed SCD Type 2 versions of enriched BLS series metadata.",
     schema=SERIES_SCHEMA,
 )
-@dp.expect(
-    "series_identifier_required",
-    SERIES_EXPECTATIONS["series_identifier_required"],
-)
-@dp.expect("attribute_hash_required", SERIES_EXPECTATIONS["attribute_hash_required"])
-@dp.expect(
-    "series_begin_year_valid", SERIES_EXPECTATIONS["series_begin_year_valid"]
-)
+@dp.expect_all_or_drop(SERIES_EXPECTATIONS)
 def bls_series():
-    versioned = _passes_expectations(_series_source(), SERIES_EXPECTATIONS)
+    versioned = _series_source()
     series_history = Window.partitionBy("series_id").orderBy("_snapshot_id")
     changes = (
         versioned.withColumn(
@@ -493,18 +465,9 @@ def bls_series():
     comment="Typed annual population facts retained by source snapshot.",
     schema=POPULATION_SCHEMA,
 )
-@dp.expect("nation_id_required", POPULATION_EXPECTATIONS["nation_id_required"])
-@dp.expect("nation_required", POPULATION_EXPECTATIONS["nation_required"])
-@dp.expect(
-    "snapshot_key_required", POPULATION_EXPECTATIONS["snapshot_key_required"]
-)
-@dp.expect("population_is_numeric", POPULATION_EXPECTATIONS["population_is_numeric"])
-@dp.expect(
-    "population_non_negative", POPULATION_EXPECTATIONS["population_non_negative"]
-)
+@dp.expect_all_or_drop(POPULATION_EXPECTATIONS)
 def population():
-    source = _passes_expectations(_population_source(), POPULATION_EXPECTATIONS)
-    return source.select(
+    return _population_source().select(
         "nation_id",
         "nation",
         "year",
