@@ -8,7 +8,6 @@ BRONZE_TABLES = {
     "pr.class": "pr_class",
     "pr.data.0.Current": "pr_data_0_current",
     "pr.data.1.AllData": "pr_data_1_alldata",
-    "pr.contacts": "pr_contacts",
     "pr.duration": "pr_duration",
     "pr.footnote": "pr_footnote",
     "pr.measure": "pr_measure",
@@ -16,7 +15,6 @@ BRONZE_TABLES = {
     "pr.seasonal": "pr_seasonal",
     "pr.sector": "pr_sector",
     "pr.series": "pr_series",
-    "pr.txt": "pr_txt",
 }
 AUDIT_STATUSES = {"SUCCESS", "UNCHANGED", "FAILED"}
 
@@ -48,9 +46,6 @@ def append_audit_rows(rows: list[dict[str, Any]]) -> None:
             StructField("checksum_sha256", StringType(), True),
             StructField("file_size_bytes", LongType(), True),
             StructField("http_status", IntegerType(), True),
-            StructField("etag", StringType(), True),
-            StructField("last_modified", StringType(), True),
-            StructField("content_length", StringType(), True),
             StructField("download_started_at", TimestampType(), True),
             StructField("download_completed_at", TimestampType(), True),
             StructField("records_downloaded", LongType(), True),

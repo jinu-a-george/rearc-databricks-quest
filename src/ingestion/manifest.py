@@ -93,30 +93,13 @@ def commit_successful_snapshot(
     manifest_path = raw_volume_path / "manifests" / f"{snapshot_id}.json"
     write_json_atomic(manifest_path, manifest)
 
-    pointer_common = {
-        "snapshot_id": snapshot_id,
-        "manifest_path": manifest_path.relative_to(raw_volume_path).as_posix(),
-        "completed_at": completed_at,
-        "status": "SUCCESS",
-    }
-    for source_name, source_path in (
-        ("BLS", raw_volume_path / "bls" / "snapshots" / snapshot_id),
-        ("DataUSA", raw_volume_path / "population" / "snapshots" / snapshot_id),
-    ):
-        write_json_atomic(
-            source_path.parent.parent / "latest.json",
-            {
-                **pointer_common,
-                "source_name": source_name,
-                "snapshot_path": source_path.relative_to(raw_volume_path).as_posix(),
-            },
-        )
-
-    # This pointer is the commit marker readers use if per-source pointers race.
     write_json_atomic(
         latest_snapshot_path(raw_volume_path),
         {
-            **pointer_common,
+            "snapshot_id": snapshot_id,
+            "manifest_path": manifest_path.relative_to(raw_volume_path).as_posix(),
+            "completed_at": completed_at,
+            "status": "SUCCESS",
             "source_name": "BLS+DataUSA",
             "snapshot_path": ".",
         },

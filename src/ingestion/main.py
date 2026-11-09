@@ -94,12 +94,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--raw-volume-path")
     parser.add_argument("--job-id")
     parser.add_argument("--job-run-id")
-    parser.add_argument("--polling-interval-seconds", type=int)
+    parser.add_argument(
+        "--force-publish",
+        choices=("true", "false"),
+        default="false",
+        help="Publish a new snapshot and run downstream pipelines even if checksums match.",
+    )
     arguments = parser.parse_args(argv)
 
     config = IngestionConfig.from_environment(
         bls_contact_email=arguments.bls_contact_email,
-        polling_interval_seconds=arguments.polling_interval_seconds,
         raw_volume_path=arguments.raw_volume_path,
     )
     job_id, job_run_id = _job_context(arguments)
@@ -108,6 +112,7 @@ def main(argv: list[str] | None = None) -> None:
             config,
             databricks_job_id=job_id,
             databricks_job_run_id=job_run_id,
+            force_publish=arguments.force_publish == "true",
         )
     except SnapshotIngestionFailure as error:
         try:

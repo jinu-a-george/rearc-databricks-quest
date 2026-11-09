@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from src.ingestion.bls_client import discover_file_urls
@@ -14,6 +15,7 @@ from src.ingestion.ingestion import (
     SnapshotIngestionFailure,
     ingest_snapshot,
 )
+from src.ingestion import main as ingestion_main
 from src.ingestion.manifest import (
     load_latest_manifest,
     new_snapshot_id,
@@ -21,11 +23,6 @@ from src.ingestion.manifest import (
     write_json_atomic,
 )
 from src.ingestion.population_client import validate_population_payload
-from src.ingestion.source_monitor import (
-    SourceFile,
-    SourceMetadata,
-    unchanged_from_previous_snapshot,
-)
 
 
 POPULATION_PAYLOAD = {
@@ -75,10 +72,16 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, *, invalid_bls: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        invalid_bls: bool = False,
+        population_payload: dict[str, Any] | None = None,
+    ) -> None:
         self.headers: dict[str, str] = {}
         self.get_calls: list[str] = []
         self.invalid_bls = invalid_bls
+        payload = population_payload or POPULATION_PAYLOAD
         self.contents = {
             BLS_DIRECTORY_URL + "pr.series": (
                 b"<a href='pr.series'>pr.series</a>"
@@ -86,16 +89,8 @@ class FakeSession:
             "https://honolulu-api.datausa.io/tesseract/data.jsonrecords"
             "?cube=acs_yg_total_population_1&drilldowns=Year%2CNation"
             "&locale=en&measures=Population": json.dumps(
-                POPULATION_PAYLOAD
+                payload
             ).encode(),
-        }
-
-    def _headers(self, url: str) -> dict[str, str]:
-        content = self.contents[url]
-        return {
-            "ETag": f'"{len(content)}"',
-            "Last-Modified": "Wed, 05 Nov 2026 15:34:59 GMT",
-            "Content-Length": str(len(content)),
         }
 
     def get(self, url: str, **kwargs) -> FakeResponse:
@@ -105,10 +100,7 @@ class FakeSession:
         content = self.contents[url]
         if self.invalid_bls and url.endswith("/pr.series"):
             content = b"<html>not a data file</html>"
-        return FakeResponse(content, headers=self._headers(url))
-
-    def head(self, url: str, **kwargs) -> FakeResponse:
-        return FakeResponse(headers=self._headers(url))
+        return FakeResponse(content)
 
     def close(self) -> None:
         pass
@@ -129,6 +121,49 @@ class IngestionConfigTests(unittest.TestCase):
 
         self.assertEqual(config.bls_contact_email, "job@example.com")
         self.assertEqual(config.raw_volume_path, Path("/tmp/volume"))
+
+    def test_force_publish_argument_defaults_false_and_accepts_boolean_strings(self) -> None:
+        result = {
+            "snapshot_id": "20261105153459478275",
+            "authoritative_snapshot_id": "20261105153459478275",
+            "snapshot_changed": True,
+            "process_required": True,
+            "manifest": {"ingestion_status": "SUCCESS"},
+            "audit_rows": [],
+        }
+        with (
+            patch.object(
+                ingestion_main.IngestionConfig,
+                "from_environment",
+                return_value=object(),
+            ),
+            patch.object(ingestion_main, "_job_context", return_value=(None, None)),
+            patch.object(ingestion_main, "ingest_snapshot", return_value=result) as ingest,
+            patch.object(ingestion_main, "append_audit_rows"),
+            patch.object(ingestion_main, "_set_task_values"),
+        ):
+            ingestion_main.main(["--bls-contact-email", "test@example.com"])
+            self.assertFalse(ingest.call_args.kwargs["force_publish"])
+
+            ingestion_main.main(
+                [
+                    "--bls-contact-email",
+                    "test@example.com",
+                    "--force-publish",
+                    "true",
+                ]
+            )
+            self.assertTrue(ingest.call_args.kwargs["force_publish"])
+
+            with self.assertRaises(SystemExit):
+                ingestion_main.main(
+                    [
+                        "--bls-contact-email",
+                        "test@example.com",
+                        "--force-publish",
+                        "yes",
+                    ]
+                )
 
 
 class BLSDirectoryTests(unittest.TestCase):
@@ -201,29 +236,6 @@ class SnapshotManifestTests(unittest.TestCase):
             )
 
 
-class SourceMonitoringTests(unittest.TestCase):
-    def test_metadata_comparison_requires_all_validators(self) -> None:
-        source = SourceFile("BLS", "pr.series", BLS_DIRECTORY_URL + "pr.series")
-        metadata = SourceMetadata(source, 200, '"etag"', "date", "10")
-        previous = {
-            "files": [
-                {
-                    "source_name": "BLS",
-                    "source_file": "pr.series",
-                    "etag": '"etag"',
-                    "last_modified": "date",
-                    "content_length": "10",
-                }
-            ]
-        }
-
-        self.assertTrue(unchanged_from_previous_snapshot([metadata], previous))
-        missing_validator = SourceMetadata(source, 200, None, "date", "10")
-        self.assertFalse(
-            unchanged_from_previous_snapshot([missing_validator], previous)
-        )
-
-
 class SnapshotIngestionTests(unittest.TestCase):
     def _config(self, root: Path) -> IngestionConfig:
         return IngestionConfig(root, "test@example.com")
@@ -254,10 +266,20 @@ class SnapshotIngestionTests(unittest.TestCase):
                     / "population.json"
                 ).is_file()
             )
+            removed_metadata_fields = {"etag", "last_modified", "content_length"}
+            self.assertFalse(
+                removed_metadata_fields.intersection(result["manifest"]["files"][0])
+            )
+            self.assertFalse(
+                removed_metadata_fields.intersection(result["audit_rows"][0])
+            )
             self.assertEqual(
                 load_latest_manifest(root)["snapshot_id"], result["snapshot_id"]
             )
             self.assertTrue(result["manifest"]["files"][0]["checksum_sha256"])
+            self.assertFalse((root / "bls" / "latest.json").exists())
+            self.assertFalse((root / "population" / "latest.json").exists())
+            self.assertFalse((root / ".staging" / result["snapshot_id"]).exists())
             self.assertEqual(
                 result["audit_rows"][0]["snapshot_status"], "SUCCESS"
             )
@@ -300,12 +322,23 @@ class SnapshotIngestionTests(unittest.TestCase):
                 },
             )
 
-            second = ingest_snapshot(self._config(root), session=FakeSession())
+            session = FakeSession()
+            with self.assertLogs("src.ingestion.ingestion", level="INFO") as logs:
+                second = ingest_snapshot(
+                    self._config(root),
+                    session=session,
+                )
 
             self.assertEqual(second["manifest"]["ingestion_status"], "UNCHANGED")
             self.assertEqual(second["authoritative_snapshot_id"], first["snapshot_id"])
             self.assertFalse(second["process_required"])
-            self.assertEqual(load_latest_manifest(root)["snapshot_id"], first["snapshot_id"])
+            self.assertEqual(len(session.get_calls), 3)
+            log_output = "\n".join(logs.output)
+            self.assertIn("Downloaded 2 sources; checksums match", log_output)
+            self.assertIn("Downstream pipeline decision: action=SKIP", log_output)
+            self.assertEqual(
+                load_latest_manifest(root)["snapshot_id"], first["snapshot_id"]
+            )
             unchanged_row = next(
                 row for row in second["audit_rows"] if row["source_file"] == "pr.series"
             )
@@ -314,6 +347,82 @@ class SnapshotIngestionTests(unittest.TestCase):
             self.assertEqual(
                 unchanged_row["source_snapshot_id"], first["snapshot_id"]
             )
+
+    def test_population_change_downloads_and_compares_all_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            first = ingest_snapshot(self._config(root), session=FakeSession())
+            changed_population = json.loads(json.dumps(POPULATION_PAYLOAD))
+            changed_population["data"][0]["Population"] += 1
+            changed_session = FakeSession(population_payload=changed_population)
+
+            with self.assertLogs("src.ingestion.ingestion", level="INFO") as logs:
+                second = ingest_snapshot(
+                    self._config(root), session=changed_session
+                )
+
+            log_output = "\n".join(logs.output)
+            self.assertEqual(second["manifest"]["ingestion_status"], "SUCCESS")
+            self.assertTrue(second["process_required"])
+            self.assertEqual(
+                load_latest_manifest(root)["snapshot_id"], second["snapshot_id"]
+            )
+            self.assertIn(
+                BLS_DIRECTORY_URL + "pr.series", changed_session.get_calls
+            )
+            self.assertIn(
+                "Downloaded 2 sources; checksums differ from the previous "
+                "snapshot or source inventory.",
+                log_output,
+            )
+            self.assertIn("Downstream pipeline decision: action=RUN", log_output)
+
+            expected_source_urls = {
+                BLS_DIRECTORY_URL + "pr.series",
+                "https://honolulu-api.datausa.io/tesseract/data.jsonrecords"
+                "?cube=acs_yg_total_population_1&drilldowns=Year%2CNation"
+                "&locale=en&measures=Population",
+            }
+            self.assertEqual(
+                set(changed_session.get_calls) - {BLS_DIRECTORY_URL},
+                expected_source_urls,
+            )
+
+    def test_force_publish_creates_snapshot_when_checksums_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            first = ingest_snapshot(self._config(root), session=FakeSession())
+            write_json_atomic(
+                root / "processing" / "latest.json",
+                {
+                    "snapshot_id": first["snapshot_id"],
+                    "status": "SUCCESS",
+                    "audit_finalized": True,
+                },
+            )
+
+            with self.assertLogs("src.ingestion.ingestion", level="INFO") as logs:
+                forced = ingest_snapshot(
+                    self._config(root),
+                    session=FakeSession(),
+                    force_publish=True,
+                )
+
+            self.assertEqual(forced["manifest"]["ingestion_status"], "SUCCESS")
+            self.assertNotEqual(forced["snapshot_id"], first["snapshot_id"])
+            self.assertTrue(forced["process_required"])
+            self.assertTrue(forced["snapshot_changed"])
+            self.assertEqual(
+                load_latest_manifest(root)["snapshot_id"], forced["snapshot_id"]
+            )
+            self.assertTrue(
+                all(
+                    item["checksum_sha256"]
+                    == first["manifest"]["files"][index]["checksum_sha256"]
+                    for index, item in enumerate(forced["manifest"]["files"])
+                )
+            )
+            self.assertIn("Force publish enabled", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

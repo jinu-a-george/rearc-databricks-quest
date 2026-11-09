@@ -21,13 +21,11 @@ class IngestionConfig:
     bls_contact_email: str
     connect_timeout_seconds: int = 10
     read_timeout_seconds: int = 120
-    polling_interval_seconds: int = 604800
 
     @classmethod
     def from_environment(
         cls,
         bls_contact_email: str | None = None,
-        polling_interval_seconds: int | None = None,
         raw_volume_path: str | None = None,
     ) -> IngestionConfig:
         contact_email = (
@@ -48,16 +46,9 @@ class IngestionConfig:
         if not volume_path:
             raise ValueError("RAW_VOLUME_PATH must not be empty.")
 
-        interval = polling_interval_seconds
-        if interval is None:
-            interval = int(os.environ.get("POLLING_INTERVAL_SECONDS", "604800"))
-        if interval <= 0:
-            raise ValueError("POLLING_INTERVAL_SECONDS must be a positive integer.")
-
         return cls(
             raw_volume_path=Path(volume_path),
             bls_contact_email=contact_email,
-            polling_interval_seconds=interval,
         )
 
     @property

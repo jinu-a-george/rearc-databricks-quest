@@ -27,10 +27,7 @@ from src.ingestion.manifest import (
 from src.ingestion.population_client import validate_population_payload
 from src.ingestion.source_monitor import (
     SourceFile,
-    SourceMetadata,
     discover_sources,
-    inspect_sources,
-    unchanged_from_previous_snapshot,
 )
 
 
@@ -43,7 +40,7 @@ HTTP_RETRY = Retry(
     status=4,
     backoff_factor=1,
     status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset({"GET", "HEAD"}),
+    allowed_methods=frozenset({"GET"}),
     respect_retry_after_header=True,
 )
 EXPECTED_BLS_HEADERS = {
@@ -175,7 +172,6 @@ def _download_source(
     session: requests.Session,
     source: SourceFile,
     destination: Path,
-    metadata: SourceMetadata,
     config: IngestionConfig,
     snapshot_id: str,
 ) -> dict[str, Any]:
@@ -220,11 +216,6 @@ def _download_source(
         "file_size_bytes": byte_count,
         "checksum_sha256": digest.hexdigest(),
         "http_status": response.status_code,
-        "etag": response.headers.get("ETag") or metadata.etag,
-        "last_modified": response.headers.get("Last-Modified")
-        or metadata.last_modified,
-        "content_length": response.headers.get("Content-Length")
-        or metadata.content_length,
         "record_count": record_count,
         "malformed_record_count": malformed_count,
         "headers": headers,
@@ -236,7 +227,6 @@ def _download_source(
 def _manifest_file_record(
     snapshot_id: str,
     source: SourceFile,
-    metadata: SourceMetadata | None,
     status: str,
     error_message: str | None = None,
     downloaded_path: Path | None = None,
@@ -259,10 +249,7 @@ def _manifest_file_record(
         "downloaded_at": None,
         "file_size_bytes": file_size_bytes,
         "checksum_sha256": checksum_sha256,
-        "http_status": metadata.http_status if metadata else None,
-        "etag": metadata.etag if metadata else None,
-        "last_modified": metadata.last_modified if metadata else None,
-        "content_length": metadata.content_length if metadata else None,
+        "http_status": None,
         "record_count": None,
         "malformed_record_count": None,
         "headers": None,
@@ -297,9 +284,6 @@ def _audit_rows(
             "checksum_sha256": item.get("checksum_sha256"),
             "file_size_bytes": item.get("file_size_bytes"),
             "http_status": item.get("http_status"),
-            "etag": item.get("etag"),
-            "last_modified": item.get("last_modified"),
-            "content_length": item.get("content_length"),
             "download_started_at": _as_datetime(item.get("download_started_at")),
             "download_completed_at": _as_datetime(item.get("downloaded_at")),
             "records_downloaded": item.get("record_count"),
@@ -357,13 +341,21 @@ def _same_checksums(
         for item in previous_manifest.get("files", [])
         if isinstance(item, dict)
     }
-    if len(old_files) != len(current):
-        return False
+    current_keys = {
+        (item["source_name"], item["source_file"]) for item in current
+    }
+    all_checksums_match = current_keys == set(old_files)
     for item in current:
-        old = old_files.get((item["source_name"], item["source_file"]))
-        if not old or old.get("checksum_sha256") != item.get("checksum_sha256"):
-            return False
-    return True
+        key = (item["source_name"], item["source_file"])
+        old = old_files.get(key)
+        checksum = item.get("checksum_sha256")
+        previous_checksum = old.get("checksum_sha256") if old else None
+        if checksum is None or previous_checksum is None:
+            all_checksums_match = False
+        elif checksum != previous_checksum:
+            all_checksums_match = False
+
+    return all_checksums_match
 
 
 def ingest_snapshot(
@@ -371,6 +363,7 @@ def ingest_snapshot(
     *,
     databricks_job_id: int | None = None,
     databricks_job_run_id: int | None = None,
+    force_publish: bool = False,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
     snapshot_id = new_snapshot_id()
@@ -380,7 +373,6 @@ def ingest_snapshot(
     started_at = utc_timestamp()
     staging_root = config.raw_volume_path / ".staging" / snapshot_id
     sources: list[SourceFile] = []
-    metadata_by_key: dict[tuple[str, str], SourceMetadata] = {}
     file_records: list[dict[str, Any]] = []
     promoted_paths: list[Path] = []
     own_session = session is None
@@ -417,122 +409,100 @@ def ingest_snapshot(
 
     try:
         sources = discover_sources(http, config)
-        metadata = inspect_sources(http, sources, config)
-        metadata_by_key = {
-            (item.source.source_name, item.source.source_file): item
-            for item in metadata
-        }
-        if unchanged_from_previous_snapshot(metadata, previous_manifest):
-            for source in sources:
-                old = previous_files[(source.source_name, source.source_file)]
-                source_metadata = metadata_by_key[
-                    (source.source_name, source.source_file)
-                ]
-                record = {
-                    **old,
-                    "snapshot_id": snapshot_id,
-                    "source_url": source.source_url,
-                    "http_status": source_metadata.http_status,
-                    "etag": source_metadata.etag,
-                    "last_modified": source_metadata.last_modified,
-                    "content_length": source_metadata.content_length,
-                    "download_started_at": None,
-                    "downloaded_at": None,
-                    "ingestion_status": "UNCHANGED",
-                    "error_message": None,
-                }
-                file_records.append(record)
+        stage_bls = staging_root / "bls"
+        stage_population = staging_root / "population"
+        stage_bls.mkdir(parents=True, exist_ok=False)
+        stage_population.mkdir(parents=True, exist_ok=True)
+
+        for source in sources:
+            destination = _stage_path(staging_root, source)
+            try:
+                file_records.append(
+                    _download_source(
+                        http,
+                        source,
+                        destination,
+                        config,
+                        snapshot_id,
+                    )
+                )
+            except (OSError, ValueError, requests.RequestException) as error:
+                failure_record = _manifest_file_record(
+                    snapshot_id,
+                    source,
+                    "FAILED",
+                    str(error),
+                    _stage_path(staging_root, source),
+                )
+                file_records.append(failure_record)
+                raise
+
+        if not force_publish and _same_checksums(file_records, previous_manifest):
             manifest.update(
                 {
                     "completed_at": utc_timestamp(),
                     "ingestion_status": "UNCHANGED",
-                    "error_details": None,
                 }
             )
+            for item in file_records:
+                item["ingestion_status"] = "UNCHANGED"
+                item["snapshot_path"] = previous_files[
+                    (item["source_name"], item["source_file"])
+                ].get("snapshot_path")
             write_failed_manifest(config.raw_volume_path, manifest)
+            shutil.rmtree(staging_root)
             LOGGER.info(
-                "All %d source files are unchanged; no new snapshot was created.",
-                len(sources),
+                "Downloaded %d sources; checksums match the previous snapshot.",
+                len(file_records),
             )
         else:
-            stage_bls = staging_root / "bls"
-            stage_population = staging_root / "population"
-            stage_bls.mkdir(parents=True, exist_ok=False)
-            stage_population.mkdir(parents=True, exist_ok=True)
-
-            for source in sources:
-                metadata_item = metadata_by_key[
-                    (source.source_name, source.source_file)
-                ]
-                destination = _stage_path(staging_root, source)
-                try:
-                    file_records.append(
-                        _download_source(
-                            http,
-                            source,
-                            destination,
-                            metadata_item,
-                            config,
-                            snapshot_id,
-                        )
-                    )
-                except (OSError, ValueError, requests.RequestException) as error:
-                    failure_record = _manifest_file_record(
-                        snapshot_id,
-                        source,
-                        metadata_item,
-                        "FAILED",
-                        str(error),
-                        _stage_path(staging_root, source),
-                    )
-                    file_records.append(failure_record)
-                    raise
-
-            if _same_checksums(file_records, previous_manifest):
-                manifest.update(
-                    {
-                        "completed_at": utc_timestamp(),
-                        "ingestion_status": "UNCHANGED",
-                    }
+            if force_publish:
+                LOGGER.info(
+                    "Force publish enabled; publishing a new snapshot regardless "
+                    "of checksum equality."
                 )
-                for item in file_records:
-                    item["ingestion_status"] = "UNCHANGED"
-                    item["snapshot_path"] = previous_files[
-                        (item["source_name"], item["source_file"])
-                    ].get("snapshot_path")
-                write_failed_manifest(config.raw_volume_path, manifest)
-                shutil.rmtree(staging_root)
-            else:
-                bls_stage = staging_root / "bls"
-                population_stage = staging_root / "population"
-                bls_snapshot = config.raw_volume_path / "bls" / "snapshots" / snapshot_id
-                population_snapshot = (
-                    config.raw_volume_path / "population" / "snapshots" / snapshot_id
-                )
-                bls_snapshot.parent.mkdir(parents=True, exist_ok=True)
-                population_snapshot.parent.mkdir(parents=True, exist_ok=True)
-                bls_stage.rename(bls_snapshot)
-                promoted_paths.append(bls_snapshot)
-                population_stage.rename(population_snapshot)
-                promoted_paths.append(population_snapshot)
+            bls_snapshot = config.raw_volume_path / "bls" / "snapshots" / snapshot_id
+            population_snapshot = (
+                config.raw_volume_path / "population" / "snapshots" / snapshot_id
+            )
+            bls_snapshot.parent.mkdir(parents=True, exist_ok=True)
+            population_snapshot.parent.mkdir(parents=True, exist_ok=True)
+            stage_bls.rename(bls_snapshot)
+            promoted_paths.append(bls_snapshot)
+            stage_population.rename(population_snapshot)
+            promoted_paths.append(population_snapshot)
 
-                for item in file_records:
-                    source = next(
-                        source
-                        for source in sources
-                        if source.source_name == item["source_name"]
-                        and source.source_file == item["source_file"]
-                    )
-                    item["snapshot_path"] = _source_path(
-                        config.raw_volume_path, source, snapshot_id
-                    ).relative_to(config.raw_volume_path).as_posix()
-                manifest.update(
-                    {
-                        "completed_at": utc_timestamp(),
-                        "ingestion_status": "SUCCESS",
-                    }
+            for item in file_records:
+                source = next(
+                    source
+                    for source in sources
+                    if source.source_name == item["source_name"]
+                    and source.source_file == item["source_file"]
                 )
-                commit_successful_snapshot(config.raw_volume_path, manifest)
+                item["snapshot_path"] = _source_path(
+                    config.raw_volume_path, source, snapshot_id
+                ).relative_to(config.raw_volume_path).as_posix()
+            manifest.update(
+                {
+                    "completed_at": utc_timestamp(),
+                    "ingestion_status": "SUCCESS",
+                }
+            )
+            commit_successful_snapshot(config.raw_volume_path, manifest)
+            try:
+                staging_root.rmdir()
+            except OSError:
+                LOGGER.warning(
+                    "Could not remove the empty staging directory %s.",
+                    staging_root,
+                    exc_info=True,
+                )
+            if not force_publish:
+                LOGGER.info(
+                    "Downloaded %d sources; checksums differ from the previous "
+                    "snapshot or source inventory.",
+                    len(file_records),
+                )
 
             LOGGER.info(
                 "Ingestion snapshot %s completed with status %s.",
@@ -549,6 +519,13 @@ def ingest_snapshot(
         process_required = bool(
             authoritative_snapshot_id
             and authoritative_snapshot_id != processed_snapshot_id
+        )
+        LOGGER.info(
+            "Downstream pipeline decision: action=%s authoritative_snapshot=%s "
+            "processed_snapshot=%s",
+            "RUN" if process_required else "SKIP",
+            authoritative_snapshot_id,
+            processed_snapshot_id,
         )
         audit_rows = _audit_rows(
             snapshot_id,
@@ -583,7 +560,6 @@ def ingest_snapshot(
                     _manifest_file_record(
                         snapshot_id,
                         source,
-                        metadata_by_key.get(key),
                         "FAILED",
                         "Snapshot aborted before this source file was downloaded.",
                     )
